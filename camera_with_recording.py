@@ -81,19 +81,32 @@ DEPTH_NEW_MIN = 150
 DEPTH_NEW_MAX = 1500
 
 
-def post_encode_config(config=frame_config_encode(), host=HOST, port=PORT):
-    r = requests.post('http://{}:{}/set_cfg'.format(host, port), config)
+def post_encode_config(config=frame_config_encode(), host=HOST, port=PORT, timeout=5):
+    # A bare requests call with no timeout hangs for the OS-level TCP
+    # connect timeout (~20s on Windows) and, uncaught, kills the whole
+    # script the moment the camera is briefly unreachable (still booting,
+    # a loose USB-C cable, its virtual network adapter not up yet). Fail
+    # fast and let the caller decide whether to retry instead.
+    try:
+        r = requests.post('http://{}:{}/set_cfg'.format(host, port), config, timeout=timeout)
+    except requests.exceptions.RequestException as e:
+        print(f"[Error] Could not reach camera at {host}:{port} to configure it ({e.__class__.__name__}).")
+        return False
     if(r.status_code == requests.codes.ok):
         return True
     return False
 
 
-def get_frame_from_http(host=HOST, port=PORT):
-    r = requests.get('http://{}:{}/getdeep'.format(host, port))
+def get_frame_from_http(host=HOST, port=PORT, timeout=5):
+    try:
+        r = requests.get('http://{}:{}/getdeep'.format(host, port), timeout=timeout)
+    except requests.exceptions.RequestException:
+        return None
     if(r.status_code == requests.codes.ok):
         deepimg = r.content
         (frameid, stamp_msec) = struct.unpack('<QQ', deepimg[0:8+8])
         return deepimg
+    return None
 
 
 def depth_to_colormap(depth_array):
@@ -144,7 +157,15 @@ rgb_buffer = []
 depth_color_buffer = []
 depth_raw_buffer = []
 
+# Each recording method below registers itself into these three lists, so
+# commenting out a whole method block (from its ">>> METHOD" line to its
+# "<<< METHOD" line) removes it completely - no other edits needed.
+KEY_HANDLERS = []   # key-press handlers connected to the figure
+KEY_HINTS = []      # short "press X to ..." text shown in the RGB title
+STARTUP_INFO = []   # lines printed once at start-up
 
+
+# >>> METHOD A: fixed-duration clip (press 'r', stops by itself after CLIP_DURATION_SEC) >>>
 def on_key_press(event):
     """Matplotlib key-press handler: press 'r' to start a fixed-duration recording."""
     global is_recording, record_until, rgb_buffer, depth_color_buffer, depth_raw_buffer
@@ -160,6 +181,69 @@ def on_key_press(event):
             depth_color_buffer = []
             depth_raw_buffer = []
             print(f"[Recording] Started — capturing {CLIP_DURATION_SEC}s clip …")
+
+
+KEY_HANDLERS.append(on_key_press)
+KEY_HINTS.append("'r' = record a clip")
+STARTUP_INFO.append(f"Press 'r' in the figure window to record a {CLIP_DURATION_SEC}s clip.")
+# <<< METHOD A <<<
+
+
+# >>> METHOD B: manual start / stop (press 'b' to begin, 'e' to end) >>>
+# Keys are chosen to avoid matplotlib's built-in shortcuts in the figure
+# window (e.g. 's' opens a save-file dialog that freezes the capture loop,
+# 'f' = fullscreen, 'q' = quit, 'p'/'o' = pan/zoom, 'g'/'k'/'l' = grid/scales).
+START_KEY = 'b'
+STOP_KEY = 'e'
+# Safety cap: frames are held in memory until the clip is saved (roughly
+# 17 MB per second at ~10 fps), so a recording you forget to stop is ended
+# and saved automatically after this many seconds. Raise it if you need longer.
+MANUAL_MAX_SEC = 60
+
+
+def on_key_press_manual(event):
+    """Matplotlib key-press handler: START_KEY begins recording, STOP_KEY ends it and saves the clip."""
+    global is_recording, record_until, rgb_buffer, depth_color_buffer, depth_raw_buffer
+
+    if event.key == START_KEY:
+        with recording_lock:
+            if is_recording:
+                print(f"[Recording] Already recording — press '{STOP_KEY}' to stop.")
+                return
+            is_recording = True
+            record_until = time.time() + MANUAL_MAX_SEC   # safety cap only; normally you stop it
+            rgb_buffer = []
+            depth_color_buffer = []
+            depth_raw_buffer = []
+            print(f"[Recording] Started — press '{STOP_KEY}' to stop "
+                  f"(auto-stops after {MANUAL_MAX_SEC}s).")
+
+    elif event.key == STOP_KEY:
+        with recording_lock:
+            if not is_recording:
+                print(f"[Recording] Not recording — press '{START_KEY}' to start "
+                      f"(a clip that hit the {MANUAL_MAX_SEC}s cap has already been saved).")
+                return
+            is_recording = False
+            n_frames = len(rgb_buffer)
+            if n_frames == 0:
+                print("[Recording] Stopped, but no frames were captured — nothing saved.")
+                return
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            t = threading.Thread(
+                target=save_clip,
+                args=(list(rgb_buffer), list(depth_color_buffer), list(depth_raw_buffer), timestamp),
+                daemon=True,
+            )
+            t.start()
+            print(f"[Recording] Stopped — {n_frames} frames captured "
+                  f"(~{n_frames / ESTIMATED_FPS:.0f}s), saving in background.")
+
+
+KEY_HANDLERS.append(on_key_press_manual)
+KEY_HINTS.append(f"'{START_KEY}' = start, '{STOP_KEY}' = stop")
+STARTUP_INFO.append(f"Press '{START_KEY}' in the figure window to start recording and '{STOP_KEY}' to stop.")
+# <<< METHOD B <<<
 
 
 def parse_frame(frame_data: bytes):
@@ -209,7 +293,7 @@ def show_frame(fig, frame_data: bytes):
                     daemon=True,
                 )
                 t.start()
-                print("[Recording] Clip complete — saving in background. Press 'r' to record again.")
+                print("[Recording] Clip complete — saving in background.")
 
     # --- Display ---
     ax1 = fig.add_subplot(121)
@@ -226,23 +310,53 @@ def show_frame(fig, frame_data: bytes):
         ax4.imshow(rgb)
         ax4.set_xticks([])
         ax4.set_yticks([])
-        ax4.set_title("RGB image (480x640 pixels)  |  Press 'r' to record a clip")
+        ax4.set_title("RGB image (480x640 pixels)  |  " + "   ".join(KEY_HINTS))
 
 
-if post_encode_config(frame_config_encode(1, 1, 255, 0, 2, 7, 1, 0, 0)):
+def connect_to_camera(max_attempts=10, retry_delay=2.0):
+    """Retry initial configuration instead of giving up (or crashing)
+    the instant the camera doesn't answer on the first try — it can take
+    a few seconds after being plugged in / powered on for its HTTP
+    server to come up."""
+    for attempt in range(1, max_attempts + 1):
+        if post_encode_config(frame_config_encode(1, 1, 255, 0, 2, 7, 1, 0, 0)):
+            return True
+        print(f"[Info] Camera not reachable at {HOST}:{PORT} "
+              f"(attempt {attempt}/{max_attempts}) - retrying in {retry_delay:.0f}s...")
+        time.sleep(retry_delay)
+    return False
+
+
+if connect_to_camera():
     plt.ion()
     figsize = (12, 6)
     fig = plt.figure('2D frame', figsize=figsize)
-    fig.canvas.mpl_connect('key_press_event', on_key_press)   # register keypress
+    for handler in KEY_HANDLERS:                               # register the enabled recording method(s)
+        fig.canvas.mpl_connect('key_press_event', handler)
 
-    print(f"[Info] Press 'r' in the figure window to record a {CLIP_DURATION_SEC}s clip.")
+    for line in STARTUP_INFO:
+        print(f"[Info] {line}")
     print(f"[Info] Clips will be saved to: {os.path.abspath(OUTPUT_DIR)}/")
 
+    consecutive_failures = 0
     while True:
         p = get_frame_from_http()
         if p is not None:
+            consecutive_failures = 0
             show_frame(fig, p)
+        else:
+            consecutive_failures += 1
+            if consecutive_failures == 1:
+                print(f"[Warn] Lost contact with camera at {HOST}:{PORT} - will keep "
+                      f"retrying (check the USB-C connection if this doesn't recover).")
+            elif consecutive_failures % 20 == 0:
+                print(f"[Warn] Still no response from camera after {consecutive_failures} attempts...")
+            time.sleep(0.2)
         plt.pause(0.001)
         fig.clf()
-
-    plt.ioff()
+else:
+    print(f"[Error] Could not configure camera at {HOST}:{PORT} after several attempts.")
+    print("        Check that: the camera is connected via USB-C and powered on,")
+    print("        Windows shows a network adapter on the 192.168.233.x subnet")
+    print("        (Settings > Network, or 'ipconfig' in cmd), and that no other")
+    print("        program (e.g. gui.py) already has the camera open. Then re-run.")
